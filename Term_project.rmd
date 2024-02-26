@@ -1,0 +1,852 @@
+---
+title: "STAT397"
+author: "Tian Qin"
+date: '2022-04-16'
+output: html_document
+---
+
+## TDCs of t-copula  as function of the correlation parameter and the degree of freedom
+
+
+```{r,fig.width=8}
+library(copula)
+#TDC as function of rho
+
+rs <- seq(-1,1,0.01)
+nus <-  c(3,5,9,Inf)
+n_nu <- length(nus)
+
+lam_rho <- sapply(nus, function(nu)
+  sapply(rs, function(rho) lambda(tCopula(rho,df=nu))[['lower']]))
+
+labels <- as.expression(lapply(1:n_nu, function(i)
+  bquote(nu==.(if(nus[i]==Inf) quote(infinity) else nus[i]))))
+
+
+matplot(rs,lam_rho,type='l',lty=1,lwd=2,col=1:n_nu,xlab = quote(rho),ylab=quote(lambda))
+legend('topleft',legend = labels,lty=1,lwd=2,col = 1:n_nu)
+
+#TDC as function of degree of freedom v
+
+
+rss <- c(-1,-0.5,0,0.5,1)
+nuss <-  c(seq(4,12,by=0.2),Inf)
+n_rs <- length(rss)
+
+lam_v <- sapply(rss, function(rs)
+  sapply(nuss, function(nu) lambda(tCopula(rs,df=nu))[['lower']]))
+
+labels_v <- as.expression(lapply(1:n_rs, function(i)
+  bquote(rho== .(rss[i]))))
+
+
+par(mfrow=c(1,2))
+matplot(rs,lam_rho,type='l',lty=1,lwd=2,col=1:n_nu,xlab = quote(rho),ylab=quote(lambda))
+legend('topleft',legend = labels,lty=1,lwd=2,col = 1:n_nu)
+matplot(nuss,lam_v,type='l',lty=1,lwd=2,col=1:n_rs,xlab = quote(nu),ylab=quote(lambda))
+legend('right',legend = labels_v,lty=1,lwd=2,col = 1:n_rs)
+
+```
+
+
+### data preprocessing
+
+
+```{r}
+
+SP500 <- read.csv('S&P 500 Historical Data.csv')
+DAX30 <- read.csv('^GDAXI.csv')
+
+
+SP_500 <- as.data.frame(cbind(Date=SP500$ï..Date,Price=SP500$Price))
+DAX_30 <- as.data.frame(cbind(Date=DAX30$Date,Price=DAX30$Adj.Close))
+## Combine all data with common date and delete the raw with NA value.
+library(dplyr)
+
+data<-  SP_500 %>%
+  inner_join(DAX_30, by=c("Date"))
+
+
+#clean data
+
+data[complete.cases(data), ]
+names(data) <- c('Date','SP500','DAX30')
+data <-data[!(is.na(data$DAX30) | data$DAX30=="null"), ]
+data$Date <- as.Date(data$Date,"%m/%d/%Y")
+data$SP500<- as.numeric(data$SP500)
+data$DAX30<- as.numeric(data$DAX30)
+# log-diff data
+
+log_diff_SP500 <- diff(log(as.numeric(data$SP500)))
+log_diff_DAX30<- diff(log(as.numeric(data$DAX30)))
+Date <-  as.Date(data$Date[-1],"%m/%d/%Y")
+
+
+data_t <- as.data.frame(cbind(logre_SP500=log_diff_SP500,logre_DAX30=log_diff_DAX30))
+
+library(psych)
+describe(data_t)
+
+library("reshape2")   
+data_long <- melt(data, id.vars = "Date")    # Reshaping data to long format
+head(data_long)                  # Install reshape2 package
+
+library(ggplot2)   
+ggplot(data_long,                            # Draw ggplot2 time series plot
+       aes(x = Date,
+           y = value,
+           col = variable)) +
+  geom_line()
+```
+
+
+
+
+```{r}
+#ADF test
+
+library(tseries)
+adf.test(data_t$logre_SP500)
+adf.test(data_t$logre_DAX30)
+
+plot(data_t$logre_SP500,main='log return of sp500')
+plot(data_t$logre_DAX30,main='log return of dax30')
+acf_sp <-acf(data_t$logre_SP500,plot=FALSE)
+pacf_sp <- pacf(data_t$logre_SP500,plot=FALSE)
+acf_dax <-acf(data_t$logre_DAX30,plot=FALSE)
+pacf_dax <- pacf(data_t$logre_DAX30,plot=FALSE)
+
+par(mfrow=c(2,2), mar =c(5, 4, 4, 3) + 0.1)
+plot(acf_sp,main='ACF for SP500')
+
+plot(pacf_sp,main='PACF for SP500')
+
+plot(acf_dax,main='ACF for DAX30')
+
+plot(pacf_dax,main='PACF for DAX30')
+```
+
+### Dynamic copula model - Gaussian copula
+
+```{r}
+
+### Computes the negative log likelihood of a time varying gaussian copula
+
+GaussianTVLogL <- function(theta, data,n_burnedout=100,n_MAD=15) {
+  n <- dim(data)[1]
+
+  u_t= data[(n_burnedout+n_MAD+1):n, 1]
+  v_t = data[(n_burnedout+n_MAD+1):n, 2]
+
+  # dynamic copula parameter estimation
+  rho <- GaussianDyCopula(thetas=theta, data=data,n_burnedout=n_burnedout,n_MAD=n_MAD)
+
+  
+  rho <- rho[-1]  # abandon the initial value to match the length time series
+  term1 <- 1/(sqrt(1-rho^2))
+  term2 <- exp(-0.5*( (qnorm(u_t))^2 + (qnorm(v_t))^2 -2*rho*(qnorm(u_t))*(qnorm(v_t)))/(1-rho^2))
+  term3 <- exp(0.5*((qnorm(u_t))^2 + (qnorm(v_t))^2))
+
+  c_t <- term1*term2*term3
+  LLc = sum(log(c_t))
+  LLc = -LLc
+  return(LLc)
+}
+
+
+GaussianDyCopula <- function(thetas,data,n_burnedout=100,n_MAD=15){
+   n <- dim(data)[1]
+  rhos <- rep(0,n-n_burnedout-n_MAD)
+  burned_data <- data[1:n_burnedout,] # estimate the cor of first 100 observations
+  rhos[1]     <- cor(burned_data[,1],burned_data[,2],method="kendall")  # method of kendall is more robust
+  used_data <- data[(n_burnedout+1):n,]
+  
+  u <- used_data[,1]
+  v <- used_data[,2]
+  for (i in (1+n_MAD):(n-n_burnedout) ){# take care of the firs n_MAD observations
+
+     temp <- thetas[1]+thetas[2]*rhos[i-n_MAD]+thetas[3]*mean(abs(u[(i-n_MAD):(i-1)]-v[(i-n_MAD):(i-1)]))
+  
+    rhos[i+1-n_MAD] <- (1-exp(-temp))/(1+exp(-temp))   #dynamic evolution
+  }
+  
+  return(rhos)
+  
+}
+
+## Step1: estimation of marginal distribution of eta and obtain the standardized residuals eta_t
+library(fGarch)
+model_X <-garchFit(~arma(1,1)+garch(1,1),data_t$logre_SP500,cond.dist = 'std')
+summary(model_X)
+
+std_resX <- residuals(model_X,standardize=TRUE)
+p_std_resX <-pobs(std_resX) #pt(std_resX,as.numeric(coef(model_X)[7]))#pnorm(std_resX)
+
+
+
+model_Y <-garchFit(~garch(1,1),data_t$logre_DAX30,cond.dist = 'std')
+summary(model_Y)
+
+std_resY <- residuals(model_Y,standardize=TRUE)
+p_std_resY <-pobs(std_resY)#pt(std_resY,as.numeric(coef(model_Y)[5]))#pnorm(std_resY)
+
+## Step2: estimation of dynamic copula with gaussian copula
+std_res_Data <- cbind(u=p_std_resX,v=p_std_resY)
+
+u <- GaussianTVLogL(theta=c(1,0,0),data=std_res_Data)
+
+library(nloptr)
+n_burnedout <-100
+n_MAD <-15
+n <- length(std_resX)
+out = nloptr(x0 = c(0.5, -1.5, 1.8), eval_f = GaussianTVLogL, lb = c(-15, -15, -15), ub = c(15, 15, 15),
+opts = list(algorithm = "NLOPT_LN_COBYLA", xtol_rel = 1e-05, maxeval=10000), data = std_res_Data,n_burnedout=100,n_MAD=15)
+
+sol = out$solution
+sol
+# aic = 2 * length(sol) - 2 * (-ClaytonTVLogL(sol, udata))
+ se = diag(sqrt(solve(optimHess(sol, GaussianTVLogL, data = std_res_Data))))
+se
+
+data_actual <- Date[(n_burnedout+n_MAD+1):n]
+rho_est <- GaussianDyCopula(theta=sol,data=std_res_Data)[-1]
+plot( data_actual,rho_est,type='l')
+# #
+#  acf(data_t$logre_DAX30)
+#  pacf(data_t$logre_DAX30)
+# # # 
+# # 
+# # plot(data$BAMLC2A0C35Y)
+# # 
+# library(tseries)
+#   adf.test(diff(data$A2P2AA_CS))
+# 
+
+```
+
+
+### Dynamic copula model - T copula
+
+```{r,warning=FALSE}
+
+### Computes the negative log likelihood of a time varying gaussian copula
+StudentTDyCopula <- function(thetas,data,n_burnedout=100,n_MAD=10){
+   n <- dim(data)[1]
+  rhos <- rep(0,n-n_burnedout-n_MAD)
+  nus <- rep(0,n-n_burnedout-n_MAD)
+  burned_data <- data[1:n_burnedout,] # estimate the cor of first 100 observations
+  
+  t_copulamodel <- fitCopula(tCopula(dim=2,dispstr = "un"),data=burned_data) # fit t-copula for first 100 obs
+  rhos[1] <- as.numeric(coef(summary(t_copulamodel))[,1])[1]
+  nus[1]  <- as.numeric(coef(summary(t_copulamodel))[,1])[2]
+  used_data <- data[(n_burnedout+1):n,]
+  
+  u <- used_data[,1]
+  v <- used_data[,2]
+  for (i in (1+n_MAD):(n-n_burnedout) ){# take care of the firs n_MAD observations thetas[2]*rhos[i-n_MAD]
+
+     temp_rho <- thetas[1]+thetas[2]*mean(abs(u[(i-n_MAD):(i-1)]-v[(i-n_MAD):(i-1)]))
+     temp_nu  <-thetas[3]++thetas[4]*mean(abs(u[(i-n_MAD):(i-1)]-v[(i-n_MAD):(i-1)]))
+    rhos[i+1-n_MAD] <- (1-exp(-temp_rho))/(1+exp(-temp_rho))   #dynamic evolution
+    nus[i+1-n_MAD] <- 98/(1+exp(-temp_nu)) +2  #dynamic evolution
+  }
+  
+  return(list(rho=rhos,nu=nus))
+  
+}
+
+StudentTTVLogL <- function(theta, data,n_burnedout=100,n_MAD=10) {
+  n <- dim(data)[1]
+
+  u_t= data[(n_burnedout+n_MAD+1):n, 1]
+  v_t = data[(n_burnedout+n_MAD+1):n, 2]
+
+  # dynamic copula parameter estimation
+  est_T <- StudentTDyCopula(thetas=theta, data=data,n_burnedout=n_burnedout,n_MAD=n_MAD)
+
+  
+  rho <- est_T$rho[-1]  # abandon the initial value to match the length time series
+  nu <- est_T$nu[-1] 
+  term1 <- gamma((nu+2)/2)*gamma((nu/2))/(sqrt(1-rho^2)*gamma((nu+1)/2)^2)
+  term2 <- (1+( (qt(u_t,nu))^2 + (qt(v_t,nu))^2 -2*rho*(qt(u_t,nu))*(qt(v_t,nu)))/(1-rho^2)*nu)^(-(nu+2)/2)
+  term3 <- ((1+(qt(u_t,nu))^2/nu+(qt(v_t,nu))^2/nu))^((nu+1)/2)
+
+  c_t <- term1*term2*term3
+  LLc = sum(log(c_t))
+  LLc = -LLc
+  return(LLc)
+}
+
+
+
+
+## Step1: estimation of marginal distribution of eta and obtain the standardized residuals eta_t
+library(fGarch)
+model_X <-garchFit(~arma(1,1)+garch(1,1),data_t$logre_SP500,cond.dist = 'std')
+summary(model_X)
+
+std_resX <- residuals(model_X,standardize=TRUE)
+p_std_resX <-pobs(std_resX)##pnorm(std_resX)
+# p_std_resX <- ifelse(p_std_resX==1,0.99,p_std_resX ) # ignore NAN in calculation
+# p_std_resX <- ifelse(p_std_resX==0,0.01,p_std_resX )
+# 
+
+model_Y <-garchFit(~garch(1,1),data_t$logre_DAX30,cond.dist = 'std')
+summary(model_Y)
+
+std_resY <- residuals(model_Y,standardize=TRUE)
+p_std_resY <-pobs(std_resY)##pnorm(std_resY)
+# p_std_resY <- ifelse(p_std_resY==1,0.99,p_std_resY ) # ignore NAN in calculation
+# p_std_resY <- ifelse(p_std_resY==0,0.01,p_std_resY )
+## Step2: estimation of dynamic copula with gaussian copula
+std_res_Data <- cbind(u=p_std_resX,v=p_std_resY)
+library(copula)
+u <- StudentTTVLogL(theta=c(1,0,0,1),data=std_res_Data)
+u
+library(nloptr)
+n_burnedout <-100
+n_MAD <-10
+n <- length(std_resX)
+out = nloptr(x0 = c(0.5, -1.5, 1.8,0.3), eval_f = StudentTTVLogL, lb = c(-10, -10, -20,-20), ub = c(10, 10, 10,10),
+opts = list(algorithm = "NLOPT_LN_COBYLA", xtol_rel = 1e-05, maxeval=10000), data = std_res_Data,n_burnedout=n_burnedout,n_MAD=n_MAD)
+
+sol = out$solution
+sol
+# aic = 2 * length(sol) - 2 * (-ClaytonTVLogL(sol, udata))
+ se = diag(sqrt(solve(optimHess(sol, StudentTTVLogL, data = std_res_Data,n_burnedout=n_burnedout,n_MAD=n_MAD))))
+se
+
+est <- StudentTDyCopula(thetas=sol,data=std_res_Data,n_burnedout=n_burnedout,n_MAD=n_MAD)
+
+lambda_t_pair1 <- TDC_t(est$rho[-1],est$nu[-1])
+data_actual <- Date[(n_burnedout+n_MAD+1):n]
+plot( data_actual,lambda_t_pair1,type='l')
+# 
+
+
+```
+
+
+
+
+
+
+#ignore this one
+```{r,warning=FALSE,echo=FALE}
+library(VineCopula)
+### Computes the negative log likelihood of a time varying gaussian copula
+JCCopula <- function(thetas,data,n_burnedout=100,n_MAD=10){
+   n <- dim(data)[1]
+  Lamb_Us <- rep(0,n-n_burnedout-n_MAD)
+  Lamb_Ls <- rep(0,n-n_burnedout-n_MAD)
+  burned_data <- data[1:n_burnedout,] # estimate the cor of first 100 observations
+  
+  JC_copulamodel <- BiCopEst(burned_data[,1], burned_data[,2], family = 9)# fit t-copula for first 100 obs
+  Lamb_Us[1] <- 2-2^(1/as.numeric(as.character( JC_copulamodel)[2]))
+  Lamb_Ls[1]  <-2^( -1/as.numeric(as.character( JC_copulamodel)[3]))
+  used_data <- data[(n_burnedout+1):n,]
+  
+  u <- used_data[,1]
+  v <- used_data[,2]
+  for (i in (1+n_MAD):(n-n_burnedout) ){# take care of the firs n_MAD observations thetas[2]*rhos[i-n_MAD]
+
+     temp_LU<- thetas[1]+thetas[2]*mean(abs(u[(i-n_MAD):(i-1)]-v[(i-n_MAD):(i-1)]))
+     temp_LL  <-thetas[3]+thetas[4]*mean(abs(u[(i-n_MAD):(i-1)]-v[(i-n_MAD):(i-1)]))
+    Lamb_Us[i+1-n_MAD] <-1/(1+exp(-temp_LU))#dynamic evolution
+    Lamb_Ls[i+1-n_MAD] <-1/(1+exp(-temp_LL))#dynamic evolution
+  }
+  
+  return(list(Upper_tail=Lamb_Us,Lower_tail=Lamb_Ls))
+  
+}
+
+JC_cdf <- function(u, v){
+  
+  1-(1-((1-(1-u)^(params[[1]]))^(-params[[2]])+(1-(1-v)^(params[[1]]))^(-params[[2]])-1)^(-1/params[[2]]))^(1/params[[1]])
+} 
+
+
+C_JC <- quote(  1-(1-((1-(1-u)^(k))^(-l)+(1-(1-v)^(k))^(-l)-1)^(-1/l))^(1/k))
+C_JC_u <- D(C_JC,'u')
+C_JC_uv <- D(C_JC_u,'v')
+
+SJCTVLogL <- function(theta, data,n_burnedout=100,n_MAD=10) {
+  n <- dim(data)[1]
+
+  u_t= data[(n_burnedout+n_MAD+1):n, 1]
+  v_t = data[(n_burnedout+n_MAD+1):n, 2]
+
+  # dynamic copula parameter estimation
+  est_T <- JCCopula(thetas=theta, data=data,n_burnedout=n_burnedout,n_MAD=n_MAD)
+
+  
+  Upper_tails <- est_T$Upper_tail[-1]-0.01  # abandon the initial value to match the length time series
+  Lower_tails <- est_T$Lower_tail[-1]-0.01 
+  
+  rec<-c()
+  llh <-0
+  for(i in 1:length(u_t)){
+    k <- 1/log2(2-Upper_tails[i])
+    l <- -1/log2(Lower_tails[i]) 
+    u <- u_t[i]
+    v <- v_t[i]
+    #(f,var = c(u=u_t[i], v=v_t[i]), order = c(1, 1), accuracy = 6)
+
+    c_uv <- eval(C_JC_uv)+0.01 # avoid singular value
+    
+    llh <-llh+ log(c_uv)
+    rec[i] <- c_uv
+  }
+  
+
+  LLc = -llh
+  return(LLc)
+}
+
+
+
+
+## Step1: estimation of marginal distribution of eta and obtain the standardized residuals eta_t
+library(fGarch)
+model_X <-garchFit(~arma(1,1)+garch(1,1),data_t$logre_SP500,cond.dist = 'std')
+summary(model_X)
+
+std_resX <- residuals(model_X,standardize=TRUE)
+p_std_resX <-pobs(std_resX)## pseudo observation
+
+
+model_Y <-garchFit(~garch(1,1),data_t$logre_DAX30,cond.dist = 'std')
+summary(model_Y)
+
+std_resY <- residuals(model_Y,standardize=TRUE)
+p_std_resY <-pobs(std_resY)##pnorm(std_resY)
+
+## Step2: estimation of dynamic copula with gaussian copula
+std_res_Data <- cbind(u=p_std_resX,v=p_std_resY)
+library(copula)
+u <- SJCTVLogL(theta=c(1,0,0,1),data=std_res_Data)
+u
+library(nloptr)
+n_burnedout <-100
+n_MAD <-10
+n <- length(std_resX)
+out2 = nloptr(x0 = c(-3,-1.2,1.8,3), eval_f = SJCTVLogL, lb = c(-5, -5, -5,-5), ub = c(5, 5, 5,5),
+opts = list(algorithm = "NLOPT_LN_COBYLA", xtol_rel = 1e-05, maxeval=10000), data = std_res_Data,n_burnedout=n_burnedout,n_MAD=n_MAD)
+
+sol2 = out2$solution
+sol2
+# aic = 2 * length(sol) - 2 * (-ClaytonTVLogL(sol, udata))
+ se2 = diag(sqrt(solve(optimHess(sol2, SJCTVLogL, data = std_res_Data,n_burnedout=n_burnedout,n_MAD=n_MAD))))
+se2
+
+est2 <- JCCopula(thetas=sol2,data=std_res_Data,n_burnedout=n_burnedout,n_MAD=n_MAD)
+
+Upper_TDC <- est2$Upper_tail[-1]
+
+Lower_TDC <- est2$Lower_tail[-1]
+data_actual <- Date[(n_burnedout+n_MAD+1):n]
+plot( data_actual,Upper_TDC,type='l',col='red')
+lines(data_actual,Lower_TDC,col='blue')
+```
+
+
+
+
+
+## Joe-Clayton copula
+
+```{r,warning=FALSE}
+library(VineCopula)
+### Computes the negative log likelihood of a time varying gaussian copula
+JCCopula <- function(thetas,data,n_burnedout=100,n_MAD=10){
+   n <- dim(data)[1]
+  Lamb_Us <- rep(0,n-n_burnedout-n_MAD)
+  Lamb_Ls <- rep(0,n-n_burnedout-n_MAD)
+  burned_data <- data[1:n_burnedout,] # estimate the cor of first 100 observations
+  
+  JC_copulamodel <- BiCopEst(burned_data[,1], burned_data[,2], family = 9)# fit t-copula for first 100 obs
+  Lamb_Us[1] <- 2-2^(1/as.numeric(as.character( JC_copulamodel)[2]))
+  Lamb_Ls[1]  <-2^( -1/as.numeric(as.character( JC_copulamodel)[3]))
+  used_data <- data[(n_burnedout+1):n,]
+  
+  u <- used_data[,1]
+  v <- used_data[,2]
+  for (i in (1+n_MAD):(n-n_burnedout) ){# take care of the firs n_MAD observations thetas[2]*rhos[i-n_MAD]
+
+     temp_LU<- thetas[1]+thetas[2]*Lamb_Us[i-n_MAD]+thetas[3]*mean(abs(u[(i-n_MAD):(i-1)]-v[(i-n_MAD):(i-1)]))
+     temp_LL  <-thetas[4]+thetas[5]*Lamb_Ls[i-n_MAD]+thetas[6]*mean(abs(u[(i-n_MAD):(i-1)]-v[(i-n_MAD):(i-1)]))
+    Lamb_Us[i+1-n_MAD] <-1/(1+exp(-temp_LU))#dynamic evolution
+    Lamb_Ls[i+1-n_MAD] <-1/(1+exp(-temp_LL))#dynamic evolution
+  }
+  
+  return(list(Upper_tail=Lamb_Us,Lower_tail=Lamb_Ls))
+  
+}
+
+JC_cdf <- function(u, v){
+  
+  1-(1-((1-(1-u)^(params[[1]]))^(-params[[2]])+(1-(1-v)^(params[[1]]))^(-params[[2]])-1)^(-1/params[[2]]))^(1/params[[1]])
+} 
+
+
+C_JC <- quote(  1-(1-((1-(1-u)^(k))^(-l)+(1-(1-v)^(k))^(-l)-1)^(-1/l))^(1/k))
+C_JC_u <- D(C_JC,'u')
+C_JC_uv <- D(C_JC_u,'v')
+
+SJCTVLogL <- function(theta, data,n_burnedout=100,n_MAD=10) {
+  n <- dim(data)[1]
+
+  u_t= data[(n_burnedout+n_MAD+1):n, 1]
+  v_t = data[(n_burnedout+n_MAD+1):n, 2]
+
+  # dynamic copula parameter estimation
+  est_T <- JCCopula(thetas=theta, data=data,n_burnedout=n_burnedout,n_MAD=n_MAD)
+
+  
+  Upper_tails <- est_T$Upper_tail[-1]-0.01  # abandon the initial value to match the length time series
+  Lower_tails <- est_T$Lower_tail[-1]-0.01 
+  
+  rec<-c()
+  llh <-0
+  for(i in 1:length(u_t)){
+    k <- 1/log2(2-Upper_tails[i])
+    l <- -1/log2(Lower_tails[i]) 
+    u <- u_t[i]
+    v <- v_t[i]
+    #(f,var = c(u=u_t[i], v=v_t[i]), order = c(1, 1), accuracy = 6)
+
+    c_uv <- eval(C_JC_uv)+0.001 # avoid singular value
+    
+    llh <-llh+ log(c_uv)
+    rec[i] <- c_uv
+  }
+  
+
+  LLc = -llh
+  return(LLc)
+}
+
+
+
+
+## Step1: estimation of marginal distribution of eta and obtain the standardized residuals eta_t
+library(fGarch)
+model_X <-garchFit(~arma(1,1)+garch(1,1),data_t$logre_SP500,cond.dist = 'std')
+summary(model_X)
+
+std_resX <- residuals(model_X,standardize=TRUE)
+p_std_resX <-pobs(std_resX)## pseudo observation
+
+
+model_Y <-garchFit(~garch(1,1),data_t$logre_DAX30,cond.dist = 'std')
+summary(model_Y)
+
+std_resY <- residuals(model_Y,standardize=TRUE)
+p_std_resY <-pobs(std_resY)##pnorm(std_resY)
+
+## Step2: estimation of dynamic copula with gaussian copula
+std_res_Data <- cbind(u=p_std_resX,v=p_std_resY)
+library(copula)
+u <- SJCTVLogL(theta=c(1,0,0,1,1,1),data=std_res_Data)
+u
+library(nloptr)
+n_burnedout <-100
+n_MAD <-10
+n <- length(std_resX)
+out2 = nloptr(x0 = c(-3,-1.2,1.8,3,1,1), eval_f = SJCTVLogL, lb = c(-5, -5, -15,-5,-5,-15), ub = c(5, 5, 5,5,5,5),
+opts = list(algorithm = "NLOPT_LN_COBYLA", xtol_rel = 1e-05, maxeval=10000), data = std_res_Data,n_burnedout=n_burnedout,n_MAD=n_MAD)
+
+sol2 = out2$solution
+sol2
+# aic = 2 * length(sol) - 2 * (-ClaytonTVLogL(sol, udata))
+ se2 = diag(sqrt(solve(optimHess(sol2, SJCTVLogL, data = std_res_Data,n_burnedout=n_burnedout,n_MAD=n_MAD))))
+se2
+
+est2 <- JCCopula(thetas=sol2,data=std_res_Data,n_burnedout=n_burnedout,n_MAD=n_MAD)
+
+Upper_TDC <- est2$Upper_tail[-1]
+
+Lower_TDC <- est2$Lower_tail[-1]
+data_actual <- Date[(n_burnedout+n_MAD+1):n]
+plot( data_actual,Upper_TDC,type='l',col='red')
+lines(data_actual,Lower_TDC,col='blue')
+```
+
+```{r}
+library("reshape2")   
+data_JC <- as.data.frame(cbind(Upper_tdc=Upper_TDC,Lower_tdc=Lower_TDC,Dates=data_actual))
+data_JC$Dates <-  as.Date( Date[(n_burnedout+n_MAD+1):n],"%m/%d/%Y")
+data_long <- melt(data_JC, id.vars = "Dates")    # Reshaping data to long format
+head(data_long)                  # Install reshape2 package
+
+library(ggplot2)   
+ggplot(data_long,                            # Draw ggplot2 time series plot
+       aes(x = Dates,
+           y = value,
+           col = variable)) +
+  geom_line()
+
+```
+
+
+
+
+##Nonparametric tail-dependence coefficient
+
+```{r}
+
+library(copula)
+
+X <- cbind(data_t$logre_SP500[1:1169],data_t$logre_DAX30[1:1169]) #baml-a2p2;  vix-bofaml; negative sp500-vix  650: 2008/9/14  ; 1169 th element
+
+ n <-length(X[,1])
+
+
+
+u <- matrix(replicate(2,(1:n)/n),ncol=2) #evaluation points i/n from 1/n to n/n  
+
+
+empiricalCopula <- C.n(u,X,ties.method = 'average')
+eva_points <- (1:n)/n
+
+TDC_l <- empiricalCopula/eva_points  # candidates for lower tail dependence
+TDC_u <- (-2*eva_points+1+ empiricalCopula)/(1-eva_points)    # candidates for upper tail dependence
+TDC_u <- ifelse(TDC_u<0,0,TDC_u)
+```
+
+## Palteau_finding algorithm
+
+```{r}
+
+#step1
+b<- round(n/200)
+window <- 2*b+1
+m <- round(sqrt(n-2*b))
+
+TDC_l_smoothed <-c()
+for(i in 1:(n-2*b-1)){
+  TDC_l_smoothed[i] <- mean(TDC_l[i:(i+window)])
+  
+
+}
+
+sigma <- sqrt(var(TDC_l_smoothed))
+
+#lower tail
+
+kl <-1
+plateu_f <- function(k,m,TDC_s){
+  sum_p <-0
+  for(i in 1:(m-1)){
+    sum_p <- sum_p+abs(TDC_s[k+i]-TDC_s[k])
+  }
+  
+  return(sum_p)
+}
+
+while(plateu_f(kl,m,TDC_l_smoothed) >2*sigma){
+  
+  kl<- kl+1
+  
+  
+}
+
+
+best_TDC_l <- mean(TDC_l_smoothed[kl:(kl+m-1)])  # first k satisfying the plateau condition
+best_TDC_l
+
+#upper tail
+
+TDC_u_smoothed <-c()
+for(i in 1:(n-2*b-2)){  # the last evaluation point is inappropriate
+  TDC_u_smoothed[i] <- mean(TDC_u[i:(i+window)])
+  
+
+}
+
+sigma_u <- sqrt(var(TDC_u_smoothed))
+
+
+ku <-n-2*b-m-1
+plateu_f_u <- function(k,m,TDC_s){
+  sum_p <-0
+  for(i in 1:(m-1)){
+    sum_p <- sum_p+abs(TDC_s[k+i]-TDC_s[k])
+  }
+  
+  return(sum_p)
+}
+
+while(plateu_f_u(ku,m,TDC_u_smoothed) >2*sigma_u){
+  
+  ku<- ku-1
+  
+  
+}
+
+
+best_TDC_u <- mean(TDC_u_smoothed[ku:(ku+m-1)])  # first k satisfying the plateau condition
+
+best_TDC_u
+
+```
+
+
+## nonparametric bootstrap
+
+```{r,echo=FALSE}
+
+
+#X <- cbind(data$BAMLC2A0C35Y[1:650],data$A2P2AA_CS[1:650]) #baml-a2p2;  vix-bofaml; negative sp500-vix  650: 2008/9/14
+set.seed(42)
+n_bootstrap <- 1000
+n <-length(X[,1])
+u <- matrix(replicate(2,(1:n)/n),ncol=2) #evaluation points i/n from 1/n to n/n  
+
+boot_l <-c()
+boot_u <-c()
+for(t in 1:n_bootstrap){
+  
+  
+  boot_X <- X[sample(1:n,n,replace = TRUE),]
+
+  empiricalCopula <- C.n(u,boot_X,ties.method = 'average')
+  eva_points <- (1:n)/n
+
+  TDC_l_b <- empiricalCopula/eva_points  # candidates for lower tail dependence
+  TDC_u_b <- (-2*eva_points+1+ empiricalCopula)/(1-eva_points)
+  TDC_u_b <- ifelse(TDC_u_b<0,0,TDC_u_b)
+  TDC_l_smoothed <-c()
+  for(i in 1:(n-2*b-1)){
+    TDC_l_smoothed[i] <- mean(TDC_l_b[i:(i+window)])
+    
+  
+  }
+  
+  sigma <- sqrt(var(TDC_l_smoothed))
+  
+  #lower tail
+  
+  kl <-1
+  plateu_f <- function(k,m,TDC_s){
+    sum_p <-0
+    for(i in 1:(m-1)){
+      sum_p <- sum_p+abs(TDC_s[k+i]-TDC_s[k])
+    }
+    
+    return(sum_p)
+  }
+  
+  while(plateu_f(kl,m,TDC_l_smoothed) >2*sigma){
+    
+    kl<- kl+1
+    
+    
+  }
+  
+  
+  best_TDC_l <- mean(TDC_l_smoothed[kl:(kl+m-1)])  # first k satisfying the plateau condition
+  boot_l[t] <-best_TDC_l
+  
+  #upper tail
+  
+  TDC_u_smoothed <-c()
+  for(i in 1:(n-2*b-2)){  # the last evaluation point is inappropriate
+    TDC_u_smoothed[i] <- mean(TDC_u_b[i:(i+window)])
+    
+  
+  }
+  
+  sigma_u <- sqrt(var(TDC_u_smoothed))
+  
+  
+  ku <-n-2*b-m-1
+  plateu_f_u <- function(k,m,TDC_s){
+    sum_p <-0
+    for(i in 1:(m-1)){
+      sum_p <- sum_p+abs(TDC_s[k+i]-TDC_s[k])
+    }
+    
+    return(sum_p)
+  }
+  
+  while(plateu_f_u(ku,m,TDC_u_smoothed) >2*sigma_u){
+    
+    ku<- ku-1
+    
+    
+  }
+  
+  
+  best_TDC_u <- mean(TDC_u_smoothed[ku:(ku+m-1)])  # first k satisfying the plateau condition
+  
+   boot_u[t] <-best_TDC_u
+  
+}
+
+quantile(boot_l,c(0.025,0.975))
+quantile(boot_u,c(0.025,0.975))
+sqrt(var(boot_l))
+sqrt(var(boot_u))
+
+```
+
+## Fix the optimal threshold
+
+```{r}
+
+
+#X <- cbind(data$BAMLC2A0C35Y[1:650],data$A2P2AA_CS[1:650]) #baml-a2p2;  vix-bofaml; negative sp500-vix  650: 2008/9/14
+set.seed(42)
+n_bootstrap <- 1000
+n <-length(X[,1])
+u <- matrix(replicate(2,(1:n)/n),ncol=2) #evaluation points i/n from 1/n to n/n  
+
+boot_l <-c()
+boot_u <-c()
+for(t in 1:n_bootstrap){
+  
+  
+  boot_X <- X[sample(1:n,n,replace = TRUE),]
+
+  empiricalCopula <- C.n(u,boot_X,ties.method = 'average')
+  eva_points <- (1:n)/n
+
+  TDC_l_b <- empiricalCopula/eva_points  # candidates for lower tail dependence
+  TDC_u_b <- (-2*eva_points+1+ empiricalCopula)/(1-eva_points)
+  TDC_u_b <- ifelse(TDC_u_b<0,0,TDC_u_b)
+  TDC_l_smoothed <-c()
+  for(i in 1:(n-2*b-1)){
+    TDC_l_smoothed[i] <- mean(TDC_l_b[i:(i+window)])
+    
+  
+  }
+  
+  
+  best_TDC_l <- mean(TDC_l_smoothed[kl:(kl+m-1)])  # first k satisfying the plateau condition
+  boot_l[t] <-best_TDC_l
+  
+  #upper tail
+  
+  TDC_u_smoothed <-c()
+  for(i in 1:(n-2*b-2)){  # the last evaluation point is inappropriate
+    TDC_u_smoothed[i] <- mean(TDC_u_b[i:(i+window)])
+    
+  
+  }
+
+  
+  best_TDC_u <- mean(TDC_u_smoothed[ku:(ku+m-1)])  # first k satisfying the plateau condition
+  
+   boot_u[t] <-best_TDC_u
+  
+}
+
+quantile(boot_l,c(0.025,0.975))
+quantile(boot_u,c(0.025,0.975))
+sqrt(var(boot_l))
+sqrt(var(boot_u))
+
+```
+
+
